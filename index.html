@@ -1,0 +1,1434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spaghetti Cat 🍝🐱</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: radial-gradient(ellipse at center, #2c1654 0%, #0f0a1e 100%);
+            font-family: 'Segoe UI', Arial, sans-serif;
+        }
+
+        #gameContainer {
+            position: relative;
+            display: inline-block;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.6), 0 0 0 2px rgba(255,255,255,0.08);
+            overflow: hidden;
+        }
+
+        canvas {
+            display: block;
+            cursor: crosshair;
+        }
+    </style>
+</head>
+<body>
+<div id="gameContainer">
+    <canvas id="gameCanvas" width="1000" height="700"></canvas>
+</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx    = canvas.getContext('2d');
+
+// ── Audio ─────────────────────────────────────────────────────────────────────
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+function playSound(freq, dur, type = 'sine', vol = 0.12) {
+    try {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain); gain.connect(audioCtx.destination);
+        osc.type = type;
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+        osc.start(); osc.stop(audioCtx.currentTime + dur);
+    } catch(e) {}
+}
+
+function playStretch(amount) {
+    // Rubbery squeak, pitch rises with pull
+    playSound(200 + amount * 2, 0.08, 'sawtooth', 0.05);
+}
+
+function playLaunch() {
+    playSound(1400, 0.05, 'square', 0.08);
+    setTimeout(() => playSound(900, 0.12, 'triangle', 0.07), 50);
+}
+
+function playHit() {
+    playSound(880, 0.15, 'sine', 0.12);
+    setTimeout(() => playSound(1100, 0.2, 'sine', 0.1), 60);
+    setTimeout(() => playSound(1320, 0.25, 'sine', 0.08), 120);
+}
+
+function playMiss() {
+    playSound(250, 0.3, 'sawtooth', 0.08);
+}
+
+function playWin() {
+    [523, 659, 784, 1047, 1319].forEach((f, i) =>
+        setTimeout(() => playSound(f, 0.3, 'sine', 0.1), i * 120));
+}
+
+// ── Game State ────────────────────────────────────────────────────────────────
+const game = {
+    level: 1,
+    meatballsFed: 0,
+    totalShots: 0,
+    gameWon: false,
+    meatballs: [],
+    fallingObjects: [],
+    particles: [],
+    splats: [],
+    stars: [],
+    meatballBeingDragged: null,
+    catX: 835,
+    catY: 332,
+    catTargetX: 835,
+    catTargetY: 332,
+    isDragging: false,
+    catHappy: false,
+    catHappyTimer: 0,
+    catMouthOpen: false,
+    catMouthTimer: 0,
+    catBounce: 0,
+    lastPullDist: 0,
+    dragLogical: { x: 0, y: 0 },
+    tick: 0,
+    spawnTimer: 0,
+    showLevelMessage: 0,
+    wind: 0.05,
+    windTimer: 0,
+    mouthCycleTimer: 0,
+    portals: [
+        { x: 350, y: 300, color: '#33AAFF', active: false },
+        { x: 750, y: 150, color: '#FF7700', active: false }
+    ],
+    obstacle: { x: 500, y: 100, w: 40, h: 300, active: false },
+    dog: {
+        x: 500,
+        y: 800,
+        vx: 0,
+        vy: 0,
+        radius: 60,
+        isActive: false,
+        jumpTimer: 0,
+        chewing: 0
+    }
+};
+
+// ── Slingshot & Cat Positions ─────────────────────────────────────────────────
+const SLING_X = 200;
+const SLING_Y = canvas.height - 150;
+const MOUTH_R = 40;
+
+// ── Meatball ──────────────────────────────────────────────────────────────────
+class Meatball {
+    constructor(x, y) {
+        this.x = x; this.y = y;
+        this.vx = 0; this.vy = 0;
+        this.r = 15;
+        this.isActive = true;
+    }
+
+    update() {
+        if (this === game.meatballBeingDragged) return;
+        this.vy += 0.55;
+        if (game.level >= 5) this.vx += game.wind;
+        this.x  += this.vx;
+        this.y  += this.vy;
+
+        const bounceDamping = game.level >= 7 ? -0.95 : -0.5;
+
+        if (this.x - this.r < 0)              { this.x = this.r;               this.vx *= bounceDamping; }
+        if (this.x + this.r > canvas.width)   { this.x = canvas.width - this.r; this.vx *= bounceDamping; }
+        if (game.level >= 7 && this.y - this.r < 0) { this.y = this.r; this.vy *= bounceDamping; }
+
+        if (this.y - this.r > canvas.height) {
+            this.isActive = false;
+            game.splats.push({ x: this.x, y: canvas.height, life: 1 });
+            playMiss();
+        }
+
+        if (game.obstacle.active) {
+            const obs = game.obstacle;
+            const testX = Math.max(obs.x, Math.min(this.x, obs.x + obs.w));
+            const testY = Math.max(obs.y, Math.min(this.y, obs.y + obs.h));
+            const distX = this.x - testX;
+            const distY = this.y - testY;
+            if (Math.hypot(distX, distY) < this.r) {
+                if (Math.abs(distX) > Math.abs(distY)) {
+                    this.vx *= bounceDamping;
+                    this.x += Math.sign(distX) * (this.r - Math.abs(distX) + 1);
+                } else {
+                    this.vy *= bounceDamping;
+                    this.y += Math.sign(distY) * (this.r - Math.abs(distY) + 1);
+                }
+                playHitObject();
+            }
+        }
+
+        if (game.portals[0].active && Math.abs(this.vy) > 1) { // Prevents getting stuck
+            const p1 = game.portals[0];
+            const p2 = game.portals[1];
+            if (Math.hypot(this.x - p1.x, this.y - p1.y) < this.r + 25) {
+                this.x = p2.x + Math.sign(this.vx) * 45;
+                this.y = p2.y;
+                playSound(800, 0.1, 'sine', 0.1);
+            } else if (Math.hypot(this.x - p2.x, this.y - p2.y) < this.r + 25) {
+                this.x = p1.x + Math.sign(this.vx) * 45;
+                this.y = p1.y;
+                playSound(800, 0.1, 'sine', 0.1);
+            }
+        }
+    }
+
+    draw() {
+        const { x, y, r } = this;
+        // Shadow
+        ctx.fillStyle = 'rgba(0,0,0,0.2)';
+        ctx.beginPath();
+        ctx.ellipse(x, y + r - 2, r * 0.85, r * 0.3, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Main sphere gradient
+        const g = ctx.createRadialGradient(x - r*0.35, y - r*0.35, r*0.05, x, y, r);
+        g.addColorStop(0,   '#C8764A');
+        g.addColorStop(0.4, '#A0522D');
+        g.addColorStop(0.8, '#7B3A1E');
+        g.addColorStop(1,   '#5C2810');
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Herb flecks
+        ctx.fillStyle = '#4A6741';
+        [[-.3,-.2],[.2,.3],[-.1,.4],[.35,-.35]].forEach(([dx,dy]) => {
+            ctx.beginPath();
+            ctx.ellipse(x + dx*r, y + dy*r, r*0.08, r*0.04, dx*Math.PI, 0, Math.PI*2);
+            ctx.fill();
+        });
+
+        // Specular highlight
+        const hi = ctx.createRadialGradient(x - r*0.3, y - r*0.3, 0, x - r*0.3, y - r*0.3, r*0.5);
+        hi.addColorStop(0,   'rgba(255,220,180,0.7)');
+        hi.addColorStop(1,   'rgba(255,220,180,0)');
+        ctx.fillStyle = hi;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
+function playHitObject() {
+    playSound(400, 0.1, 'square', 0.1);
+    setTimeout(() => playSound(600, 0.1, 'triangle', 0.08), 40);
+}
+
+function playChomp() {
+    playSound(300, 0.1, 'sawtooth', 0.1);
+    setTimeout(() => playSound(200, 0.15, 'sawtooth', 0.1), 80);
+}
+
+// ── Falling Object ────────────────────────────────────────────────────────────
+class FallingObject {
+    constructor() {
+        this.radius = 15 + Math.random() * 15;
+        this.x = this.radius + Math.random() * (canvas.width - this.radius * 2);
+        this.y = -this.radius;
+        this.vy = 2 + Math.random() * 2;
+        this.rot = Math.random() * Math.PI * 2;
+        this.rotSpeed = (Math.random() - 0.5) * 0.1;
+        this.color = `hsl(${Math.random()*360}, 60%, 70%)`;
+        this.isActive = true;
+    }
+    update() {
+        this.y += this.vy;
+        this.rot += this.rotSpeed;
+        if (this.y - this.radius > canvas.height) {
+            this.isActive = false;
+        }
+    }
+    draw() {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.rot);
+        ctx.fillStyle = this.color;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, this.radius, this.radius * 0.8, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+        ctx.restore();
+    }
+}
+
+// ── Particle ──────────────────────────────────────────────────────────────────
+class Particle {
+    constructor(x, y, vx, vy, color, size = 6) {
+        this.x = x; this.y = y; this.vx = vx; this.vy = vy;
+        this.color = color; this.life = 1;
+        this.decay = Math.random() * 0.02 + 0.015;
+        this.size = size + Math.random() * 4;
+    }
+    update() {
+        this.x += this.vx; this.y += this.vy;
+        this.vy += 0.25; this.life -= this.decay;
+    }
+    draw() {
+        ctx.globalAlpha = Math.max(0, this.life);
+        ctx.fillStyle = this.color;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, Math.max(0, this.size * this.life), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+    }
+}
+
+// ── Star (win screen) ─────────────────────────────────────────────────────────
+class Star {
+    constructor() {
+        this.x = Math.random() * canvas.width;
+        this.y = Math.random() * canvas.height;
+        this.vy = -(Math.random() * 2 + 1);
+        this.vx = (Math.random() - 0.5) * 1.5;
+        this.life = 1;
+        this.decay = 0.005 + Math.random() * 0.008;
+        this.size = 8 + Math.random() * 14;
+        this.color = `hsl(${Math.random()*60+30},100%,65%)`;
+        this.rot = Math.random() * Math.PI * 2;
+    }
+    update() {
+        this.x += this.vx; this.y += this.vy;
+        this.life -= this.decay; this.rot += 0.05;
+    }
+    draw() {
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, this.life);
+        ctx.fillStyle = this.color;
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.rot);
+        drawStar5(0, 0, this.size, this.size * 0.4);
+        ctx.fill();
+        ctx.restore();
+    }
+}
+
+function drawStar5(cx, cy, outer, inner) {
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+        const r   = i % 2 === 0 ? outer : inner;
+        const ang = (i / 10) * Math.PI * 2 - Math.PI / 2;
+        i === 0 ? ctx.moveTo(cx + Math.cos(ang)*r, cy + Math.sin(ang)*r)
+                : ctx.lineTo(cx + Math.cos(ang)*r, cy + Math.sin(ang)*r);
+    }
+    ctx.closePath();
+}
+
+// ── Kitchen Background ────────────────────────────────────────────────────────
+function drawKitchen() {
+    // Wall (upper portion only, above counter)
+    const wall = ctx.createLinearGradient(0, 0, 0, 455);
+    wall.addColorStop(0,   '#F5EDD6');
+    wall.addColorStop(0.5, '#EDE0C4');
+    wall.addColorStop(1,   '#DACCAA');
+    ctx.fillStyle = wall;
+    ctx.fillRect(0, 0, canvas.width, 455);
+
+    // Subtle edge vignette on wall
+    ['left', 'right'].forEach(side => {
+        const vx = side === 'left' ? 0 : canvas.width;
+        const vg = ctx.createLinearGradient(vx, 0, side === 'left' ? 120 : canvas.width - 120, 0);
+        vg.addColorStop(0, 'rgba(0,0,0,0.07)');
+        vg.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = vg;
+        ctx.fillRect(0, 0, canvas.width, 455);
+    });
+
+    // Backsplash tiles behind counter
+    const tileTop = 398, tileH = 62;
+    for (let col = 0; col < canvas.width; col += 44) {
+        for (let row = tileTop; row < tileTop + tileH; row += 44) {
+            ctx.fillStyle = col % 88 === 0 ? '#E8D8F0' : '#F2E8FA';
+            ctx.fillRect(col, row, 43, Math.min(43, tileTop + tileH - row));
+            ctx.strokeStyle = 'rgba(180,160,200,0.45)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(col, row, 43, Math.min(43, tileTop + tileH - row));
+        }
+    }
+
+    // Window (taller to fill the extra wall space)
+    drawWindow(360, 25, 280, 240);
+
+    // Upper cabinets (taller to match the taller wall)
+    drawCabinet(10, 40, 200, 315, false);
+    drawCabinet(790, 40, 200, 315, false);
+
+    // ── Counter top (marble) ─────────────────────────────────────────────────
+    const marble = ctx.createLinearGradient(0, 455, 0, 477);
+    marble.addColorStop(0,   '#F2F2F0');
+    marble.addColorStop(0.35, '#E8E6E0');
+    marble.addColorStop(0.7,  '#D8D4CC');
+    marble.addColorStop(1,    '#C8C0B4');
+    ctx.fillStyle = marble;
+    ctx.fillRect(0, 455, canvas.width, 22);
+    // Marble veins
+    ctx.strokeStyle = 'rgba(190,190,205,0.55)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(60, 457); ctx.bezierCurveTo(220, 464, 450, 458, 640, 468); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(320, 459); ctx.bezierCurveTo(530, 467, 730, 461, 940, 471); ctx.stroke();
+    // Top highlight on counter edge
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(0, 455); ctx.lineTo(canvas.width, 455); ctx.stroke();
+
+    // ── Counter front face (3-D ledge) ───────────────────────────────────────
+    const face = ctx.createLinearGradient(0, 477, 0, 503);
+    face.addColorStop(0, '#C4C0B8');
+    face.addColorStop(0.5, '#AEAAA2');
+    face.addColorStop(1,   '#949088');
+    ctx.fillStyle = face;
+    ctx.fillRect(0, 477, canvas.width, 26);
+    // Subtle veins on face
+    ctx.strokeStyle = 'rgba(160,155,148,0.4)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(150, 483); ctx.lineTo(500, 490); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(600, 485); ctx.lineTo(900, 495); ctx.stroke();
+    // Bottom shadow of face
+    const faceShadow = ctx.createLinearGradient(0, 501, 0, 517);
+    faceShadow.addColorStop(0, 'rgba(0,0,0,0.22)');
+    faceShadow.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = faceShadow;
+    ctx.fillRect(0, 501, canvas.width, 16);
+
+    // ── Perspective floor (play area below counter) ──────────────────────────
+    drawPerspectiveFloor(503, canvas.height);
+
+    // Lower cabinets (drawn on top of perspective floor)
+    drawCabinet(10, 503, 178, canvas.height - 503 - 28, true);
+    drawCabinet(canvas.width - 188, 503, 178, canvas.height - 503 - 28, true);
+
+    // Baseboard tiles at very bottom
+    drawBaseboard();
+}
+
+function drawWindow(x, y, w, h) {
+    // Sky gradient outside
+    const sky = ctx.createLinearGradient(x, y, x, y + h);
+    sky.addColorStop(0, '#87CEEB');
+    sky.addColorStop(1, '#C5E8F5');
+    ctx.fillStyle = sky;
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, 8);
+    ctx.fill();
+
+    // Clouds
+    function cloud(cx, cy, s) {
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+        [[0,0,s],[s*.6,-s*.3,s*.7],[s*1.1,0,s*.65]].forEach(([dx,dy,r]) => {
+            ctx.beginPath(); ctx.arc(cx+dx, cy+dy, r, 0, Math.PI*2); ctx.fill();
+        });
+    }
+    cloud(x + 30,  y + 50, 18);
+    cloud(x + 130, y + 35, 14);
+    cloud(x + 200, y + 60, 16);
+
+    // Window frame
+    ctx.strokeStyle = '#C8A878';
+    ctx.lineWidth = 10;
+    ctx.strokeRect(x + 5, y + 5, w - 10, h - 10);
+    ctx.strokeStyle = '#B89060';
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(x + w/2, y); ctx.lineTo(x + w/2, y + h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, y + h/2); ctx.lineTo(x + w, y + h/2); ctx.stroke();
+
+    // Glass glare
+    const glare = ctx.createLinearGradient(x, y, x + w*0.4, y + h*0.4);
+    glare.addColorStop(0, 'rgba(255,255,255,0.2)');
+    glare.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = glare;
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, 8);
+    ctx.fill();
+}
+
+function drawCabinet(x, y, w, h, lower) {
+    // Shadow behind cabinet
+    ctx.fillStyle = 'rgba(0,0,0,0.06)';
+    ctx.fillRect(x + 4, y + 4, w, h);
+
+    // Wood gradient
+    const wood = ctx.createLinearGradient(x, y, x + w, y + h);
+    wood.addColorStop(0,   '#C4975A');
+    wood.addColorStop(0.3, '#B8895A');
+    wood.addColorStop(0.7, '#A87840');
+    wood.addColorStop(1,   '#8B6030');
+    ctx.fillStyle = wood;
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, 6);
+    ctx.fill();
+
+    // Inset panel
+    const panelH = lower ? (h - 30) / 2 : h - 20;
+    const panelY = lower ? [y + 10, y + 20 + panelH] : [y + 10];
+    panelY.forEach(py => {
+        ctx.fillStyle = 'rgba(0,0,0,0.08)';
+        ctx.beginPath(); ctx.roundRect(x + 8, py, w - 16, panelH, 4); ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.roundRect(x + 8, py, w - 16, panelH, 4); ctx.stroke();
+    });
+
+    // Handle (small brass knob)
+    const hy = lower ? y + 10 + (h-20)*0.25 : y + h/2;
+    const hx = x > canvas.width/2 ? x + 14 : x + w - 14;
+    const hg = ctx.createRadialGradient(hx-2, hy-2, 1, hx, hy, 7);
+    hg.addColorStop(0, '#FFE680');
+    hg.addColorStop(1, '#B8860B');
+    ctx.fillStyle = hg;
+    ctx.beginPath(); ctx.arc(hx, hy, 7, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#8B6914'; ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Outline
+    ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.roundRect(x, y, w, h, 6); ctx.stroke();
+}
+
+function drawPerspectiveFloor(startY, endY) {
+    const vpX = canvas.width / 2;
+    const COLS = 14;
+    const ROWS = 16;
+
+    // Base fill so tiny far-tiles don't show gaps
+    ctx.fillStyle = '#AEA898';
+    ctx.fillRect(0, startY, canvas.width, endY - startY);
+
+    // Draw tiles far→near so near tiles paint over far ones
+    for (let r = ROWS - 1; r >= 0; r--) {
+        // t=0 near (bottom), t=1 far (horizon)
+        const t0 = r / ROWS;
+        const t1 = (r + 1) / ROWS;
+
+        // sqrt spacing gives realistic perspective foreshortening
+        const y_near = endY - (endY - startY) * Math.sqrt(t0);
+        const y_far  = endY - (endY - startY) * Math.sqrt(t1);
+
+        // Width scale: 1 at near, 0 at horizon
+        const s_near = 1 - Math.sqrt(t0);
+        const s_far  = 1 - Math.sqrt(t1);
+
+        const avgDepth = 1 - (Math.sqrt(t0) + Math.sqrt(t1)) * 0.5;
+
+        for (let c = 0; c < COLS; c++) {
+            const f0 = c / COLS - 0.5;
+            const f1 = (c + 1) / COLS - 0.5;
+
+            const xBL = vpX + f0 * canvas.width * s_near;
+            const xBR = vpX + f1 * canvas.width * s_near;
+            const xTL = vpX + f0 * canvas.width * s_far;
+            const xTR = vpX + f1 * canvas.width * s_far;
+
+            const isLight = (r + c) % 2 === 0;
+            const L = isLight
+                ? Math.round(68 + avgDepth * 18)   // cream: 68-86%
+                : Math.round(52 + avgDepth * 14);   // tan:   52-66%
+            const S = isLight ? 22 : 16;
+            ctx.fillStyle = `hsl(36, ${S}%, ${L}%)`;
+
+            ctx.beginPath();
+            ctx.moveTo(xTL, y_far);
+            ctx.lineTo(xTR, y_far);
+            ctx.lineTo(xBR, y_near);
+            ctx.lineTo(xBL, y_near);
+            ctx.closePath();
+            ctx.fill();
+
+            if (s_near > 0.03) {
+                ctx.strokeStyle = `rgba(70, 50, 20, ${0.06 + avgDepth * 0.20})`;
+                ctx.lineWidth = 0.8;
+                ctx.stroke();
+            }
+        }
+    }
+
+    // Atmospheric haze blends far tiles into wall colour near horizon
+    const haze = ctx.createLinearGradient(0, startY, 0, startY + (endY - startY) * 0.30);
+    haze.addColorStop(0, 'rgba(200, 190, 165, 0.90)');
+    haze.addColorStop(1, 'rgba(200, 190, 165, 0)');
+    ctx.fillStyle = haze;
+    ctx.fillRect(0, startY, canvas.width, (endY - startY) * 0.30);
+}
+
+function drawBaseboard() {
+    const floorY = canvas.height - 28;
+    const tileSize = 50;
+    for (let col = 0; col < canvas.width; col += tileSize) {
+        const even = Math.floor(col / tileSize) % 2 === 0;
+        const tg = ctx.createLinearGradient(col, floorY, col, floorY + 28);
+        tg.addColorStop(0, even ? '#C8BEA8' : '#B8AE98');
+        tg.addColorStop(1, even ? '#B0A890' : '#A09888');
+        ctx.fillStyle = tg;
+        ctx.fillRect(col, floorY, tileSize, 28);
+        ctx.strokeStyle = 'rgba(130,110,80,0.4)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(col, floorY, tileSize, 28);
+    }
+    // Shadow above baseboard
+    const sh = ctx.createLinearGradient(0, floorY - 14, 0, floorY);
+    sh.addColorStop(0, 'rgba(0,0,0,0)');
+    sh.addColorStop(1, 'rgba(0,0,0,0.20)');
+    ctx.fillStyle = sh;
+    ctx.fillRect(0, floorY - 14, canvas.width, 14);
+}
+
+// ── Slingshot ─────────────────────────────────────────────────────────────────
+function drawSlingshot() {
+    const sx = SLING_X, sy = SLING_Y;
+    const armLen = 65;
+    const fork = 0.32;
+
+    const lTipX = sx - 18 - armLen * Math.cos(fork);
+    const lTipY = sy - armLen * Math.sin(fork);
+    const rTipX = sx + 18 + armLen * Math.cos(fork);
+    const rTipY = sy - armLen * Math.sin(fork);
+
+    // Ground shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.beginPath();
+    ctx.ellipse(sx, sy + 58, 22, 6, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Handle/stick
+    const stickGrad = ctx.createLinearGradient(sx - 10, 0, sx + 10, 0);
+    stickGrad.addColorStop(0,   '#6B4226');
+    stickGrad.addColorStop(0.4, '#8B5A2B');
+    stickGrad.addColorStop(0.7, '#A0693A');
+    stickGrad.addColorStop(1,   '#5C3315');
+    ctx.strokeStyle = stickGrad;
+    ctx.lineWidth = 18;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(sx, sy + 60);
+    ctx.lineTo(sx, sy);
+    ctx.stroke();
+
+    // Left arm
+    const armGrad = ctx.createLinearGradient(sx, sy, lTipX, lTipY);
+    armGrad.addColorStop(0, '#7A4A22'); armGrad.addColorStop(1, '#6B3C18');
+    ctx.strokeStyle = armGrad;
+    ctx.lineWidth = 12;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(sx - 10, sy);
+    ctx.quadraticCurveTo(sx - 30, sy - 30, lTipX, lTipY);
+    ctx.stroke();
+
+    // Right arm
+    const armGrad2 = ctx.createLinearGradient(sx, sy, rTipX, rTipY);
+    armGrad2.addColorStop(0, '#7A4A22'); armGrad2.addColorStop(1, '#6B3C18');
+    ctx.strokeStyle = armGrad2;
+    ctx.beginPath();
+    ctx.moveTo(sx + 10, sy);
+    ctx.quadraticCurveTo(sx + 30, sy - 30, rTipX, rTipY);
+    ctx.stroke();
+
+    // Arm tip caps
+    [{ x: lTipX, y: lTipY }, { x: rTipX, y: rTipY }].forEach(({ x, y }) => {
+        ctx.fillStyle = '#5C3315';
+        ctx.beginPath(); ctx.arc(x, y, 7, 0, Math.PI*2); ctx.fill();
+    });
+
+    // Rubber band
+    const mb = game.meatballBeingDragged;
+    const bandX = mb ? mb.x : sx;
+    const bandY = mb ? mb.y : sy - 22;
+
+    ctx.lineWidth = mb ? 4 : 3;
+    ctx.lineCap = 'round';
+
+    // Draw each band segment with gradient tension color
+    [[lTipX, lTipY], [rTipX, rTipY]].forEach(([tx, ty]) => {
+        const dist = Math.hypot(bandX - tx, bandY - ty);
+        const tension = Math.min(dist / 200, 1);
+        const r = Math.round(210 + tension * 45);
+        const g2 = Math.round(60 - tension * 40);
+        ctx.strokeStyle = `rgb(${r},${g2},80)`;
+        ctx.beginPath();
+        ctx.moveTo(tx, ty);
+        ctx.lineTo(bandX, bandY);
+        ctx.stroke();
+    });
+
+    // Small rubber anchor nub
+    ctx.fillStyle = '#CC3300';
+    ctx.beginPath(); ctx.arc(bandX, bandY, mb ? 4 : 3, 0, Math.PI*2); ctx.fill();
+}
+
+// ── Trajectory ────────────────────────────────────────────────────────────────
+function drawTrajectory() {
+    if (!game.isDragging || !game.meatballBeingDragged) return;
+    const mb = game.meatballBeingDragged;
+    let tx = mb.x, ty = mb.y;
+    // Use logical drag position so dots predict the real trajectory
+    let tvx = (SLING_X - game.dragLogical.x) * 0.15;
+    let tvy = (SLING_Y - game.dragLogical.y) * 0.15;
+
+    for (let i = 0; i < 60; i++) {
+        tvy += 0.55;
+        tx += tvx; ty += tvy;
+        if (ty >= canvas.height || tx < 0 || tx > canvas.width) break;
+        const alpha = (1 - i / 60) * 0.55;
+        const radius = 3 * (1 - i / 60) + 1;
+        ctx.fillStyle = `rgba(255, 230, 100, ${alpha})`;
+        ctx.beginPath();
+        ctx.arc(tx, ty, radius, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
+// ── Cat ───────────────────────────────────────────────────────────────────────
+function drawCat() {
+    const cx = game.catX;
+    const cy = game.catY + Math.sin(game.tick * 0.04) * (game.catHappy ? 4 : 1.5);
+
+    // Drop shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
+    ctx.beginPath();
+    ctx.ellipse(cx + 10, cy + 130, 75, 18, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Tail (draw first, behind body)
+    ctx.save();
+    ctx.strokeStyle = '#F0A0B0';
+    ctx.lineWidth = 18;
+    ctx.lineCap = 'round';
+    const tailWag = Math.sin(game.tick * 0.06) * (game.catHappy ? 18 : 8);
+    ctx.beginPath();
+    ctx.moveTo(cx + 65, cy + 90);
+    ctx.bezierCurveTo(
+        cx + 140 + tailWag, cy + 70,
+        cx + 170, cy - 10,
+        cx + 155, cy - 90 + tailWag
+    );
+    ctx.stroke();
+    // Tail tip
+    ctx.strokeStyle = '#D4809A';
+    ctx.lineWidth = 22;
+    ctx.beginPath();
+    ctx.moveTo(cx + 152, cy - 84 + tailWag);
+    ctx.lineTo(cx + 150, cy - 95 + tailWag);
+    ctx.stroke();
+    ctx.restore();
+
+    // ── Body ─────────────────────────────────────────────────────────────────
+    const bodyGrad = ctx.createRadialGradient(cx - 15, cy + 15, 10, cx, cy + 40, 85);
+    bodyGrad.addColorStop(0,   '#FFCCE0');
+    bodyGrad.addColorStop(0.5, '#FFB0C8');
+    bodyGrad.addColorStop(1,   '#E88AAA');
+    ctx.fillStyle = bodyGrad;
+    ctx.beginPath();
+    ctx.arc(cx, cy + 42, 82, 0, Math.PI*2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.1)'; ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Body fur sheen
+    const sheen = ctx.createLinearGradient(cx - 40, cy, cx + 40, cy + 80);
+    sheen.addColorStop(0, 'rgba(255,255,255,0.18)');
+    sheen.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = sheen;
+    ctx.beginPath(); ctx.arc(cx, cy + 42, 82, 0, Math.PI*2); ctx.fill();
+
+    // ── Ears ─────────────────────────────────────────────────────────────────
+    [[cx - 52, cy - 100, -0.25], [cx + 52, cy - 100, 0.25]].forEach(([ex, ey, tilt]) => {
+        ctx.save();
+        ctx.translate(ex, ey); ctx.rotate(tilt);
+        // Outer ear
+        ctx.fillStyle = '#F0A0B5';
+        ctx.beginPath();
+        ctx.moveTo(-22, 18); ctx.lineTo(0, -46); ctx.lineTo(22, 18);
+        ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.1)'; ctx.lineWidth = 1.5; ctx.stroke();
+        // Inner ear
+        ctx.fillStyle = '#FF82A0';
+        ctx.beginPath();
+        ctx.moveTo(-12, 12); ctx.lineTo(0, -30); ctx.lineTo(12, 12);
+        ctx.closePath(); ctx.fill();
+        ctx.restore();
+    });
+
+    // ── Head ─────────────────────────────────────────────────────────────────
+    const headGrad = ctx.createRadialGradient(cx - 20, cy - 60, 8, cx, cy - 40, 68);
+    headGrad.addColorStop(0,   '#FFD8E8');
+    headGrad.addColorStop(0.5, '#FFB8CC');
+    headGrad.addColorStop(1,   '#E890AA');
+    ctx.fillStyle = headGrad;
+    ctx.beginPath(); ctx.arc(cx, cy - 40, 68, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.08)'; ctx.lineWidth = 2; ctx.stroke();
+
+    // ── Muzzle / Snout ───────────────────────────────────────────────────────
+    const snoutGrad = ctx.createRadialGradient(cx, cy - 12, 4, cx, cy - 8, 36);
+    snoutGrad.addColorStop(0, '#FFF0E8');
+    snoutGrad.addColorStop(1, '#FFE0D0');
+    ctx.fillStyle = snoutGrad;
+    ctx.beginPath(); ctx.ellipse(cx, cy - 8, 36, 28, 0, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = 'rgba(200,160,140,0.3)'; ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // ── Eyes ─────────────────────────────────────────────────────────────────
+    if (game.catHappy && game.catHappyTimer > 0) {
+        // Heart eyes
+        ctx.fillStyle = '#FF2060';
+        [cx - 26, cx + 26].forEach(ex => {
+            ctx.save(); ctx.translate(ex, cy - 52); ctx.scale(0.75, 0.75);
+            ctx.beginPath();
+            ctx.moveTo(0, 0);
+            ctx.bezierCurveTo(-14, -14, -28, 0, 0, 18);
+            ctx.bezierCurveTo(28, 0, 14, -14, 0, 0);
+            ctx.fill();
+            ctx.restore();
+        });
+    } else if (game.catMouthOpen && game.isDragging) {
+        // Expectant wide eyes
+        [cx - 26, cx + 26].forEach(ex => {
+            const eg = ctx.createRadialGradient(ex - 4, cy - 54, 1, ex, cy - 50, 13);
+            eg.addColorStop(0, '#5B3A8A'); eg.addColorStop(1, '#2A1A40');
+            ctx.fillStyle = eg;
+            ctx.beginPath(); ctx.arc(ex, cy - 50, 13, 0, Math.PI*2); ctx.fill();
+            // White of eye
+            ctx.fillStyle = 'rgba(255,255,255,0.9)';
+            ctx.beginPath(); ctx.arc(ex - 4, cy - 54, 5, 0, Math.PI*2); ctx.fill();
+            // Pupil
+            ctx.fillStyle = '#111';
+            ctx.beginPath(); ctx.arc(ex, cy - 50, 5, 0, Math.PI*2); ctx.fill();
+        });
+    } else {
+        // Normal eyes
+        [cx - 26, cx + 26].forEach(ex => {
+            const eg = ctx.createRadialGradient(ex - 3, cy - 53, 1, ex, cy - 50, 10);
+            eg.addColorStop(0, '#6A4EA0'); eg.addColorStop(1, '#2A1A40');
+            ctx.fillStyle = eg;
+            ctx.beginPath(); ctx.arc(ex, cy - 50, 10, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle = 'rgba(255,255,255,0.85)';
+            ctx.beginPath(); ctx.arc(ex - 3, cy - 53, 3.5, 0, Math.PI*2); ctx.fill();
+        });
+    }
+
+    // ── Nose ─────────────────────────────────────────────────────────────────
+    const noseGrad = ctx.createRadialGradient(cx, cy - 10, 1, cx, cy - 8, 8);
+    noseGrad.addColorStop(0, '#FF8AAA'); noseGrad.addColorStop(1, '#CC4466');
+    ctx.fillStyle = noseGrad;
+    ctx.beginPath();
+    ctx.moveTo(cx - 7, cy - 10);
+    ctx.quadraticCurveTo(cx, cy - 16, cx + 7, cy - 10);
+    ctx.quadraticCurveTo(cx, cy - 2, cx - 7, cy - 10);
+    ctx.fill();
+
+    // ── Mouth ─────────────────────────────────────────────────────────────────
+    let mouthOpen = game.catMouthOpen;
+    if (game.level >= 6 && game.mouthCycleTimer % 180 > 90) mouthOpen = false; // Impatient cat
+
+    if (mouthOpen) {
+        const mouthR = MOUTH_R;
+        // Mouth cavity gradient
+        const mouthGrad = ctx.createRadialGradient(cx, cy + 5, 2, cx, cy + 6, mouthR + 5);
+        mouthGrad.addColorStop(0,   '#1A0A08');
+        mouthGrad.addColorStop(0.5, '#5A1010');
+        mouthGrad.addColorStop(1,   '#8B1A1A');
+        ctx.fillStyle = mouthGrad;
+        ctx.beginPath(); ctx.arc(cx, cy + 6, mouthR, 0, Math.PI*2); ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.4)'; ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Tongue
+        const tongueGrad = ctx.createRadialGradient(cx, cy + 22, 2, cx, cy + 24, 15);
+        tongueGrad.addColorStop(0, '#FF88AA'); tongueGrad.addColorStop(1, '#DD4466');
+        ctx.fillStyle = tongueGrad;
+        ctx.beginPath();
+        ctx.ellipse(cx, cy + 24, 14, 12, 0, 0, Math.PI*2);
+        ctx.fill();
+        // Tongue crease
+        ctx.strokeStyle = 'rgba(180,50,80,0.4)'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.moveTo(cx, cy + 13); ctx.lineTo(cx, cy + 34); ctx.stroke();
+
+        // Upper teeth
+        ctx.fillStyle = '#FFFEF0';
+        [-10, 0, 10].forEach(dx => {
+            ctx.beginPath();
+            ctx.roundRect(cx + dx - 5, cy - 4, 10, 10, [3,3,0,0]);
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(200,200,180,0.5)'; ctx.lineWidth = 0.5;
+            ctx.stroke();
+        });
+    } else {
+        // Smile line when mouth is closed
+        ctx.strokeStyle = 'rgba(180,100,120,0.6)'; ctx.lineWidth = 2.5;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(cx - 16, cy + 10);
+        ctx.quadraticCurveTo(cx, cy + 20, cx + 16, cy + 10);
+        ctx.stroke();
+        // Small neutral mouth dot
+        ctx.fillStyle = 'rgba(160,80,100,0.5)';
+        ctx.beginPath(); ctx.arc(cx, cy + 10, 4, 0, Math.PI*2); ctx.fill();
+    }
+
+    // ── Whiskers ──────────────────────────────────────────────────────────────
+    ctx.lineCap = 'round';
+    const whiskAngles = [-0.15, 0, 0.15];
+    whiskAngles.forEach((ang, i) => {
+        // Left whiskers
+        ctx.strokeStyle = `rgba(80,40,60,${0.5 - i * 0.05})`;
+        ctx.lineWidth = 1.5 - i * 0.3;
+        ctx.beginPath();
+        const lx = cx - 36, ly = cy - 4 + i * 14;
+        ctx.moveTo(lx, ly);
+        ctx.lineTo(lx - 72 + i * 4, ly + Math.sin(ang) * 20);
+        ctx.stroke();
+
+        // Right whiskers
+        ctx.beginPath();
+        const rx = cx + 36, ry = cy - 4 + i * 14;
+        ctx.moveTo(rx, ry);
+        ctx.lineTo(rx + 72 - i * 4, ry + Math.sin(ang) * 20);
+        ctx.stroke();
+    });
+
+    // ── Cheek blush ───────────────────────────────────────────────────────────
+    if (game.catHappy && game.catHappyTimer > 0) {
+        const blush = ctx.createRadialGradient(cx - 40, cy - 20, 0, cx - 40, cy - 20, 22);
+        blush.addColorStop(0, 'rgba(255,120,140,0.4)');
+        blush.addColorStop(1, 'rgba(255,120,140,0)');
+        ctx.fillStyle = blush;
+        ctx.beginPath(); ctx.arc(cx - 40, cy - 20, 22, 0, Math.PI*2); ctx.fill();
+
+        const blush2 = ctx.createRadialGradient(cx + 40, cy - 20, 0, cx + 40, cy - 20, 22);
+        blush2.addColorStop(0, 'rgba(255,120,140,0.4)');
+        blush2.addColorStop(1, 'rgba(255,120,140,0)');
+        ctx.fillStyle = blush2;
+        ctx.beginPath(); ctx.arc(cx + 40, cy - 20, 22, 0, Math.PI*2); ctx.fill();
+    }
+
+    // ── Spaghetti strand hanging from mouth ───────────────────────────────────
+    if (game.meatballsFed > 0 && !game.gameWon) {
+        ctx.strokeStyle = '#E8C060';
+        ctx.lineWidth = 2.5;
+        ctx.lineCap = 'round';
+        const strandLen = Math.min(game.meatballsFed * 18, 80);
+        ctx.beginPath();
+        ctx.moveTo(cx - 5, cy + 6 + MOUTH_R);
+        ctx.bezierCurveTo(cx - 10, cy + 20 + strandLen, cx + 12, cy + 10 + strandLen, cx + 5, cy + 8 + strandLen);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cx + 5, cy + 6 + MOUTH_R);
+        ctx.bezierCurveTo(cx + 15, cy + 18 + strandLen, cx - 8, cy + 12 + strandLen, cx - 5, cy + 10 + strandLen);
+        ctx.stroke();
+    }
+}
+
+// ── Dog ───────────────────────────────────────────────────────────────────────
+function drawDog() {
+    if (!game.dog.isActive) return;
+    const { x, y, chewing } = game.dog;
+    
+    ctx.save();
+    ctx.translate(x, y);
+
+    // Head background
+    ctx.fillStyle = '#8B5A2B';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 60, 50, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Floppy Ears
+    ctx.fillStyle = '#6A4017';
+    ctx.beginPath(); ctx.ellipse(-50, 10, 15, 35, -Math.PI/6, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(50, 10, 15, 35, Math.PI/6, 0, Math.PI * 2); ctx.fill();
+
+    // Snout
+    ctx.fillStyle = '#D2B48C';
+    ctx.beginPath(); ctx.ellipse(0, 15, 40, 25, 0, 0, Math.PI * 2); ctx.fill();
+
+    // Nose
+    ctx.fillStyle = '#1A1A1A';
+    ctx.beginPath(); ctx.ellipse(0, 0, 12, 8, 0, 0, Math.PI * 2); ctx.fill();
+
+    // Eyes
+    ctx.fillStyle = '#FFF';
+    ctx.beginPath(); ctx.arc(-20, -15, 10, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(20, -15, 10, 0, Math.PI*2); ctx.fill();
+
+    ctx.fillStyle = '#000';
+    ctx.beginPath(); ctx.arc(-20, -15, 5, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(20, -15, 5, 0, Math.PI*2); ctx.fill();
+
+    // Mouth
+    if (chewing > 0) {
+        ctx.strokeStyle = '#331A00';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(-15, 25);
+        ctx.quadraticCurveTo(0, 30 + Math.sin(chewing * 0.5) * 5, 15, 25);
+        ctx.stroke();
+    } else {
+        ctx.fillStyle = '#5A1010';
+        ctx.beginPath(); ctx.ellipse(0, 25, 20, 15, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#FF88AA';
+        ctx.beginPath(); ctx.ellipse(0, 35, 12, 10, 0, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+}
+
+// ── Level Mechanics Visuals ───────────────────────────────────────────────────
+function drawWind() {
+    if (game.level < 5) return;
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 20; i++) {
+        const y = (game.tick * 1.5 + i * 40) % (canvas.height - 100);
+        const xOffset = (game.tick * game.wind * 40 + i * 133) % canvas.width;
+        let x = xOffset;
+        if (x < 0) x += canvas.width;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + 40 * Math.sign(game.wind || 1), y);
+        ctx.stroke();
+    }
+}
+
+function drawPortals() {
+    if (!game.portals[0].active) return;
+    game.portals.forEach((p, i) => {
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(game.tick * 0.05 * (i===0?1:-1));
+        const g = ctx.createRadialGradient(0,0,5, 0,0,35);
+        g.addColorStop(0, '#FFF');
+        g.addColorStop(0.3, p.color);
+        g.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath(); ctx.ellipse(0, 0, 30, 40, 0, 0, Math.PI*2); ctx.fill();
+        ctx.restore();
+    });
+}
+
+function drawObstacle() {
+    if (!game.obstacle.active) return;
+    const obs = game.obstacle;
+    ctx.fillStyle = '#6B7A8A';
+    ctx.fillRect(obs.x, obs.y, obs.w, obs.h);
+    ctx.fillStyle = '#8B9AAA';
+    ctx.fillRect(obs.x, obs.y, 8, obs.h);
+    ctx.strokeStyle = '#2C3A4A';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(obs.x, obs.y, obs.w, obs.h);
+}
+
+// ── Splats ────────────────────────────────────────────────────────────────────
+function drawSplats() {
+    for (let i = game.splats.length - 1; i >= 0; i--) {
+        const s = game.splats[i];
+        ctx.save();
+        ctx.globalAlpha = s.life * 0.65;
+        // Main blob
+        const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, 28);
+        g.addColorStop(0, '#A0522D'); g.addColorStop(1, 'rgba(80,30,10,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath(); ctx.arc(s.x, s.y, 28, 0, Math.PI*2); ctx.fill();
+        // Splat drips
+        [[8, 12], [-12, 8], [4, -6], [-6, 10]].forEach(([dx, dy]) => {
+            ctx.fillStyle = `rgba(120,60,20,${s.life * 0.5})`;
+            ctx.beginPath(); ctx.ellipse(s.x + dx*s.life, s.y + dy*s.life, 5*s.life, 3*s.life, Math.atan2(dy,dx), 0, Math.PI*2); ctx.fill();
+        });
+        ctx.restore();
+        s.life -= 0.018;
+        if (s.life <= 0) game.splats.splice(i, 1);
+    }
+}
+
+// ── UI ────────────────────────────────────────────────────────────────────────
+function drawUI() {
+    // Score panel background
+    ctx.save();
+    ctx.fillStyle = 'rgba(20,10,40,0.6)';
+    ctx.beginPath(); ctx.roundRect(14, 14, 220, 82, 12); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Labels
+    ctx.fillStyle = 'rgba(255,220,150,0.75)';
+    ctx.font = 'bold 13px Segoe UI, Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText(`LEVEL ${game.level} - MEATBALLS`, 28, 36);
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 26px Segoe UI, Arial';
+    ctx.fillText(`${game.meatballsFed}  /  5`, 28, 64);
+
+    // Progress dots
+    for (let i = 0; i < 5; i++) {
+        const filled = i < game.meatballsFed;
+        ctx.fillStyle = filled ? '#FF6B9D' : 'rgba(255,255,255,0.2)';
+        ctx.beginPath(); ctx.arc(136 + i * 18, 54, filled ? 7 : 5, 0, Math.PI*2); ctx.fill();
+        if (filled) {
+            ctx.fillStyle = 'rgba(255,255,255,0.4)';
+            ctx.beginPath(); ctx.arc(134 + i*18, 52, 2.5, 0, Math.PI*2); ctx.fill();
+        }
+    }
+
+    // Shots counter
+    ctx.fillStyle = 'rgba(200,200,255,0.6)';
+    ctx.font = 'bold 12px Segoe UI, Arial';
+    ctx.fillText(`SHOTS: ${game.totalShots}`, 28, 86);
+
+    ctx.restore();
+
+    // Bottom instruction
+    if (!game.isDragging && !game.gameWon && game.meatballs.length === 0) {
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.beginPath(); ctx.roundRect(canvas.width/2 - 220, canvas.height - 28, 440, 22, 11); ctx.fill();
+        ctx.fillStyle = 'rgba(255,240,200,0.9)';
+        ctx.font = '13px Segoe UI, Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('Click & drag the meatball backward to aim — release to launch!', canvas.width/2, canvas.height - 12);
+        ctx.restore();
+    }
+}
+
+// ── Win Screen ────────────────────────────────────────────────────────────────
+function drawWinScreen() {
+    // Confetti stars still animating underneath overlay
+    game.stars.forEach(s => { s.update(); s.draw(); });
+    game.stars = game.stars.filter(s => s.life > 0);
+    if (Math.random() < 0.4) game.stars.push(new Star());
+
+    // Overlay
+    ctx.fillStyle = 'rgba(5,0,20,0.72)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Panel
+    ctx.save();
+    const panelW = 560, panelH = 260, panelX = (canvas.width - panelW)/2, panelY = (canvas.height - panelH)/2 - 30;
+    const pg = ctx.createLinearGradient(panelX, panelY, panelX, panelY + panelH);
+    pg.addColorStop(0, 'rgba(60,20,100,0.95)');
+    pg.addColorStop(1, 'rgba(20,5,50,0.95)');
+    ctx.fillStyle = pg;
+    ctx.beginPath(); ctx.roundRect(panelX, panelY, panelW, panelH, 24); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,180,80,0.5)'; ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+
+    // Stars decorative
+    ctx.fillStyle = '#FFD700';
+    [panelX + 50, panelX + panelW - 50].forEach(sx => {
+        ctx.save(); ctx.translate(sx, panelY + panelH/2);
+        drawStar5(0, 0, 28, 11); ctx.fill(); ctx.restore();
+    });
+
+    // YOU WIN! text with glow
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.shadowColor = '#FFD700'; ctx.shadowBlur = 30;
+    ctx.font = 'bold 58px Segoe UI, Arial';
+    ctx.fillStyle = '#FFD700';
+    ctx.fillText('YOU WIN!', canvas.width/2, panelY + 90);
+    ctx.restore();
+
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.font = '24px Segoe UI, Arial';
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText(`Spaghetti Cat is stuffed! 🍝 (${game.totalShots} shots)`, canvas.width/2, panelY + 140);
+
+    ctx.font = 'bold 16px Segoe UI, Arial';
+    ctx.fillStyle = 'rgba(255,220,120,0.7)';
+    ctx.fillText('Refresh to play again', canvas.width/2, panelY + 186);
+    ctx.restore();
+}
+
+// ── Sauce Splash ──────────────────────────────────────────────────────────────
+function createSauceSplash(x, y) {
+    const colors = ['#CC1122', '#E83040', '#FF5566', '#AA0010', '#FF8090'];
+    for (let i = 0; i < 22; i++) {
+        const angle = (Math.PI * 2 * i) / 22 + Math.random() * 0.4;
+        const speed = Math.random() * 5 + 3;
+        game.particles.push(new Particle(x, y,
+            Math.cos(angle) * speed, Math.sin(angle) * speed,
+            colors[Math.floor(Math.random() * colors.length)], 4 + Math.random() * 5));
+    }
+}
+
+// ── Collision ─────────────────────────────────────────────────────────────────
+function checkMouthCollision(mb) {
+    if (game.level >= 6 && game.mouthCycleTimer % 180 > 90) return false;
+    const open = game.catMouthOpen ? 1.0 : 0.9;
+    const r = MOUTH_R * open;
+    return Math.hypot(mb.x - game.catX, mb.y - (game.catY + 6)) < r + mb.r;
+}
+
+// ── Mouse Events ──────────────────────────────────────────────────────────────
+canvas.addEventListener('mousedown', e => {
+    if (game.gameWon) return;
+    if (game.meatballs.length === 0 && !game.isDragging) {
+        const rect = canvas.getBoundingClientRect();
+        const mx = (e.clientX - rect.left) * (canvas.width / rect.width);
+        const my = (e.clientY - rect.top)  * (canvas.height / rect.height);
+        const mb = new Meatball(SLING_X, SLING_Y - 24);
+        game.meatballs.push(mb);
+        game.meatballBeingDragged = mb;
+        game.isDragging = true;
+        game.catMouthOpen = true;
+        game.dragLogical = { x: SLING_X, y: SLING_Y - 24 };
+        playSound(600, 0.08, 'sawtooth', 0.05);
+    }
+});
+
+canvas.addEventListener('mousemove', e => {
+    if (!game.isDragging || !game.meatballBeingDragged) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) * (canvas.width / rect.width);
+    const my = (e.clientY - rect.top)  * (canvas.height / rect.height);
+
+    const dx = mx - SLING_X, dy = my - SLING_Y;
+    const dist = Math.hypot(dx, dy);
+    const maxDist = 700;
+
+    // Logical position — used for velocity calculation, may go off-canvas
+    let lx = mx, ly = my;
+    if (dist > maxDist) {
+        const ang = Math.atan2(dy, dx);
+        lx = SLING_X + Math.cos(ang) * maxDist;
+        ly = SLING_Y + Math.sin(ang) * maxDist;
+    }
+    game.dragLogical = { x: lx, y: ly };
+
+    // Visual position — clamped so ball stays on screen for rubber-band drawing
+    game.meatballBeingDragged.x = lx;
+    game.meatballBeingDragged.y = Math.min(ly, canvas.height - 20);
+
+    // Squeak sound on pull (throttled)
+    if (Math.round(dist) % 40 === 0 && dist !== game.lastPullDist) {
+        playStretch(dist);
+        game.lastPullDist = Math.round(dist);
+    }
+});
+
+canvas.addEventListener('mouseup', () => {
+    if (!game.isDragging || !game.meatballBeingDragged) return;
+    const mb = game.meatballBeingDragged;
+    // Velocity from logical drag position (full pull distance, even if off-canvas)
+    mb.vx = (SLING_X - game.dragLogical.x) * 0.15;
+    mb.vy = (SLING_Y - game.dragLogical.y) * 0.15;
+    mb.x = Math.max(mb.r + 1, mb.x);
+    mb.y = Math.min(mb.y, canvas.height - 20);
+    game.isDragging = false;
+    game.catMouthOpen = false;
+    game.meatballBeingDragged = null;
+    game.totalShots++;
+    playLaunch();
+});
+
+// ── Game Loop ─────────────────────────────────────────────────────────────────
+function gameLoop() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    game.tick++;
+
+    // Level Timers
+    if (game.level >= 5 && !game.gameWon) {
+        game.windTimer++;
+        if (game.windTimer > 180) {
+            game.wind = (Math.random() - 0.5) * 0.12;
+            game.windTimer = 0;
+        }
+    }
+    if (game.level >= 6 && !game.gameWon) {
+        game.mouthCycleTimer++;
+    }
+
+    // Level 3+ Cat Movement
+    if (game.level >= 3 && !game.gameWon && game.showLevelMessage <= 0) {
+        if (game.meatballs.length === 0 || game.meatballBeingDragged !== null) {
+            const dx = game.catTargetX - game.catX;
+            const dy = game.catTargetY - game.catY;
+            if (Math.hypot(dx, dy) < 10) {
+                game.catTargetX = canvas.width - 250 + Math.random() * 150;
+                game.catTargetY = 200 + Math.random() * 250;
+            }
+            game.catX += dx * 0.035;
+            game.catY += dy * 0.035;
+        }
+    }
+
+    drawKitchen();
+    drawSlingshot();
+    drawCat();
+
+    // Update meatballs
+    for (let i = game.meatballs.length - 1; i >= 0; i--) {
+        const mb = game.meatballs[i];
+        if (!mb.isActive) { game.meatballs.splice(i, 1); continue; }
+        mb.update();
+        mb.draw();
+        if (!mb.isActive) continue;
+
+        if (checkMouthCollision(mb)) {
+            mb.isActive = false;
+            game.meatballsFed++;
+            game.catHappy = true;
+            game.catHappyTimer = 60;
+            game.catMouthOpen = true;
+            game.catMouthTimer = 45;
+            createSauceSplash(mb.x, mb.y);
+            playHit();
+
+            if (game.meatballsFed >= 5) {
+                if (game.level < 8) {
+                    game.level++;
+                    game.meatballsFed = 0;
+                    game.showLevelMessage = 120;
+                    playWin();
+                    if (game.level === 7) game.obstacle.active = true;
+                    if (game.level === 8) {
+                        game.portals[0].active = true;
+                        game.portals[1].active = true;
+                    }
+                } else {
+                    game.gameWon = true;
+                    playWin();
+                }
+            }
+        } else if (game.level >= 6 && game.mouthCycleTimer % 180 > 90) {
+            // Bounce off impatient cat's closed mouth
+            if (Math.hypot(mb.x - game.catX, mb.y - (game.catY - 10)) < 60) {
+                mb.vx *= -0.7;
+                mb.vy *= -0.7;
+                mb.x += mb.vx;
+                mb.y += mb.vy;
+                playMiss();
+            }
+        }
+    }
+
+    drawSplats();
+
+    // Animate particles
+    for (let i = game.particles.length - 1; i >= 0; i--) {
+        game.particles[i].update();
+        game.particles[i].draw();
+        if (game.particles[i].life <= 0) game.particles.splice(i, 1);
+    }
+
+    // Falling Objects logic
+    if (game.level >= 2 && !game.gameWon && game.showLevelMessage <= 0) {
+        game.spawnTimer++;
+        if (game.spawnTimer > 100) {
+            game.fallingObjects.push(new FallingObject());
+            game.spawnTimer = 0;
+        }
+    }
+    for (let i = game.fallingObjects.length - 1; i >= 0; i--) {
+        const fo = game.fallingObjects[i];
+        if (!fo.isActive) { game.fallingObjects.splice(i, 1); continue; }
+        fo.update();
+        fo.draw();
+
+        // Check collision with meatballs
+        for (let mb of game.meatballs) {
+            if (!mb.isActive || mb === game.meatballBeingDragged) continue;
+            const dist = Math.hypot(mb.x - fo.x, mb.y - fo.y);
+            if (dist < mb.r + fo.radius) {
+                // Bounce meatball
+                const angle = Math.atan2(mb.y - fo.y, mb.x - fo.x);
+                const speed = Math.hypot(mb.vx, mb.vy);
+                const newSpeed = Math.max(speed, 6);
+                mb.vx = Math.cos(angle) * newSpeed;
+                mb.vy = Math.sin(angle) * newSpeed;
+                playHitObject();
+                // Prevent sticking by pushing meatball out
+                mb.x = fo.x + Math.cos(angle) * (mb.r + fo.radius + 1);
+                mb.y = fo.y + Math.sin(angle) * (mb.r + fo.radius + 1);
+            }
+        }
+    }
+
+    // Dog logic (Level 4+)
+    if (game.level >= 4 && !game.gameWon && game.showLevelMessage <= 0) {
+        if (!game.dog.isActive) {
+            game.dog.jumpTimer++;
+            if (game.dog.jumpTimer > 150) { // jump every 2.5 seconds roughly
+                game.dog.isActive = true;
+                game.dog.x = 250 + Math.random() * (canvas.width - 400);
+                game.dog.y = canvas.height + 60;
+                game.dog.vy = -20 - Math.random() * 4; // High jump!
+                game.dog.jumpTimer = 0;
+            }
+        } else {
+            game.dog.y += game.dog.vy;
+            game.dog.vy += 0.45; // Gravity
+            if (game.dog.y > canvas.height + 100) {
+                game.dog.isActive = false;
+            }
+
+            if (game.dog.chewing > 0) game.dog.chewing--;
+
+            // Check collision with meatballs
+            for (let i = game.meatballs.length - 1; i >= 0; i--) {
+                const mb = game.meatballs[i];
+                if (!mb.isActive || mb === game.meatballBeingDragged) continue;
+                if (Math.hypot(mb.x - game.dog.x, mb.y - (game.dog.y - 15)) < game.dog.radius + mb.r) {
+                    mb.isActive = false;
+                    game.dog.chewing = 30;
+                    playChomp();
+                    createSauceSplash(mb.x, mb.y);
+                }
+            }
+        }
+    }
+
+    // Cat animation timers
+    if (game.catHappyTimer > 0)   game.catHappyTimer--;   else game.catHappy = false;
+    if (game.catMouthTimer > 0)   game.catMouthTimer--;
+    else if (!game.isDragging)    game.catMouthOpen = false;
+
+    drawTrajectory();
+    drawWind();
+    drawPortals();
+    drawObstacle();
+    drawDog();
+    drawUI();
+
+    if (game.showLevelMessage > 0) {
+        game.showLevelMessage--;
+        ctx.save();
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 56px Segoe UI, Arial';
+        ctx.fillStyle = '#FFD700';
+        ctx.shadowColor = '#FF8C00'; ctx.shadowBlur = 15;
+        ctx.fillText(`LEVEL ${game.level}!`, canvas.width/2, canvas.height/2);
+        ctx.restore();
+    }
+
+    if (game.gameWon) drawWinScreen();
+
+    requestAnimationFrame(gameLoop);
+}
+
+gameLoop();
+</script>
+</body>
+</html>

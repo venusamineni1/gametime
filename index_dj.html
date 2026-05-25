@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DJ Hamster</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a0033;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    font-family: 'Arial Rounded MT Bold', Arial, sans-serif;
+    overflow: hidden;
+  }
+  #gameCanvas {
+    border: 3px solid #6600cc;
+    border-radius: 12px;
+    box-shadow: 0 0 40px #cc00ff88;
+    display: block;
+  }
+  #ui {
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+  #restartBtn {
+    display: none;
+    background: linear-gradient(135deg, #ff00cc, #6600ff);
+    color: white;
+    border: none;
+    padding: 12px 28px;
+    font-size: 18px;
+    border-radius: 30px;
+    cursor: pointer;
+    font-family: inherit;
+    font-weight: bold;
+    box-shadow: 0 0 20px #ff00cc88;
+    transition: transform 0.1s;
+  }
+  #restartBtn:hover { transform: scale(1.07); }
+  #restartBtn:active { transform: scale(0.97); }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas" width="480" height="640"></canvas>
+<div id="ui">
+  <button id="restartBtn" onclick="restartGame()">Play Again!</button>
+</div>
+
+<script>
+// ── Constants ─────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('gameCanvas');
+const ctx    = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+const LANE_COUNT   = 4;
+const LANE_KEYS    = ['ArrowLeft','ArrowUp','ArrowDown','ArrowRight'];
+const LANE_LABELS  = ['◄','▲','▼','►'];
+const LANE_COLORS  = ['#ff4488','#44ddff','#ffcc00','#44ff88'];
+const LANE_X       = [100, 180, 300, 380]; // center x of each lane
+const LANE_W       = 60;
+
+const TARGET_Y     = H - 160;   // hit-zone y-center
+const HIT_WINDOW   = 36;        // px radius for a hit
+const NOTE_R       = 22;        // note circle radius
+const NOTE_SPEED   = 1.8;       // px per frame
+
+const GROOVE_HIT   = 8;
+const GROOVE_MISS  = 5;
+const SONG_DURATION = 45000;    // ms
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let notes       = [];
+let particles   = [];
+let groove      = 50;           // 0–100
+let score       = 0;
+let combo       = 0;
+let keysDown    = {};
+let hamsterBounce = 0;          // positive = dancing, negative = sleepy
+let hamsterBounceDir = 1;
+let discoAngle  = 0;
+let gameOver    = false;
+let songStart   = 0;
+let lastNoteSpawn = 0;
+let nextNoteId  = 0;
+let feedbackTexts = [];         // floating "+GREAT!" etc.
+let hitFlash    = [false,false,false,false];
+let hitFlashTimer= [0,0,0,0];
+
+// ── Audio ──────────────────────────────────────────────────────────────────────
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+function resumeAudio() {
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function scheduleKick(time) {
+  const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(160, time);
+  osc.frequency.exponentialRampToValueAtTime(0.001, time + 0.4);
+  gain.gain.setValueAtTime(1.0, time);
+  gain.gain.exponentialRampToValueAtTime(0.001, time + 0.4);
+  osc.start(time); osc.stop(time + 0.4);
+}
+
+function scheduleSnare(time) {
+  const bufSize = audioCtx.sampleRate * 0.15;
+  const buf = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+  const noise = audioCtx.createBufferSource();
+  noise.buffer = buf;
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'highpass'; filter.frequency.value = 2000;
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.6, time);
+  gain.gain.exponentialRampToValueAtTime(0.001, time + 0.15);
+  noise.connect(filter); filter.connect(gain); gain.connect(audioCtx.destination);
+  noise.start(time); noise.stop(time + 0.15);
+}
+
+function scheduleHihat(time) {
+  const bufSize = audioCtx.sampleRate * 0.04;
+  const buf = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+  const noise = audioCtx.createBufferSource();
+  noise.buffer = buf;
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'highpass'; filter.frequency.value = 8000;
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.25, time);
+  gain.gain.exponentialRampToValueAtTime(0.001, time + 0.04);
+  noise.connect(filter); filter.connect(gain); gain.connect(audioCtx.destination);
+  noise.start(time); noise.stop(time + 0.04);
+}
+
+const KICK_PAT  = [1,0,0,0, 0,0,1,0, 1,0,0,0, 0,0,1,0];
+const SNARE_PAT = [0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0];
+const HIHAT_PAT = [1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0];
+const BEAT_STEP_SEC = (60 / 120) / 4;
+let nextStepTime = 0, currentStep = 0, beatInterval = null;
+
+function scheduleBeat() {
+  while (nextStepTime < audioCtx.currentTime + 0.12) {
+    const s = currentStep % 16;
+    if (KICK_PAT[s])  scheduleKick(nextStepTime);
+    if (SNARE_PAT[s]) scheduleSnare(nextStepTime);
+    if (HIHAT_PAT[s]) scheduleHihat(nextStepTime);
+    nextStepTime += BEAT_STEP_SEC;
+    currentStep++;
+  }
+}
+
+function startBeat() {
+  nextStepTime = audioCtx.currentTime + 0.05;
+  currentStep  = 0;
+  beatInterval = setInterval(scheduleBeat, 50);
+}
+
+function stopBeat() {
+  clearInterval(beatInterval);
+  beatInterval = null;
+}
+
+const HIT_FREQS = [523, 659, 784, 1047];
+
+function playHitSound(lane) {
+  const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.type = 'sine';
+  osc.frequency.value = HIT_FREQS[lane];
+  gain.gain.setValueAtTime(0.35, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.18);
+  osc.start(audioCtx.currentTime); osc.stop(audioCtx.currentTime + 0.18);
+}
+
+function playMissSound() {
+  const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(180, audioCtx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(60, audioCtx.currentTime + 0.18);
+  gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.18);
+  osc.start(audioCtx.currentTime); osc.stop(audioCtx.currentTime + 0.18);
+}
+
+// Beat pattern: list of [timeMs, lane] — we'll also auto-generate
+const BEAT_PATTERN = generateSong(SONG_DURATION);
+
+// ── Song Generator ─────────────────────────────────────────────────────────────
+function generateSong(duration) {
+  const beats = [];
+  const bpm   = 120;
+  const beat  = 60000 / bpm;
+  let t = 800;
+  let pattern = 0;
+  while (t < duration - 1000) {
+    const patterns = [
+      [0,1,2,3],
+      [0,2,1,3],
+      [1,1,2,2],
+      [0,3,0,3],
+      [0,1,0,2],
+      [3,2,1,0],
+    ];
+    const seq = patterns[pattern % patterns.length];
+    for (let i = 0; i < seq.length; i++) {
+      beats.push([t + i * beat, seq[i]]);
+    }
+    // occasional double-beat
+    if (pattern % 3 === 2) {
+      beats.push([t + beat * 1.5, (seq[0] + 2) % 4]);
+    }
+    t += beat * 4;
+    pattern++;
+  }
+  return beats.sort((a,b) => a[0]-b[0]);
+}
+
+// ── Note spawning ──────────────────────────────────────────────────────────────
+let beatIndex = 0;
+
+function spawnScheduledNotes(now) {
+  const elapsed = now - songStart;
+  // How many ms ahead do we need to spawn so the note arrives at TARGET_Y in time?
+  // Travel distance from top to target = TARGET_Y + NOTE_R, speed = NOTE_SPEED px/frame @ ~60fps
+  const travelMs = ((TARGET_Y + NOTE_R) / NOTE_SPEED) * (1000 / 60);
+
+  while (beatIndex < BEAT_PATTERN.length) {
+    const [hitTime, lane] = BEAT_PATTERN[beatIndex];
+    if (hitTime - travelMs <= elapsed) {
+      notes.push({
+        id: nextNoteId++,
+        lane,
+        y: -NOTE_R,
+        hit: false,
+        missed: false,
+        alpha: 1,
+      });
+      beatIndex++;
+    } else {
+      break;
+    }
+  }
+}
+
+// ── Particle System ────────────────────────────────────────────────────────────
+function spawnConfetti(x, y, color) {
+  for (let i = 0; i < 18; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 2 + Math.random() * 4;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 3,
+      r: 4 + Math.random() * 5,
+      color: Math.random() < 0.5 ? color : '#ffffff',
+      life: 1,
+      decay: 0.025 + Math.random() * 0.02,
+    });
+  }
+}
+
+function updateParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x  += p.vx;
+    p.y  += p.vy;
+    p.vy += 0.15;
+    p.life -= p.decay;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function drawParticles() {
+  particles.forEach(p => {
+    ctx.save();
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  });
+}
+
+// ── Floating Feedback Text ─────────────────────────────────────────────────────
+function spawnText(x, y, text, color) {
+  feedbackTexts.push({ x, y, text, color, life: 1, vy: -1.5 });
+}
+
+function updateTexts() {
+  for (let i = feedbackTexts.length - 1; i >= 0; i--) {
+    const t = feedbackTexts[i];
+    t.y += t.vy;
+    t.life -= 0.022;
+    if (t.life <= 0) feedbackTexts.splice(i, 1);
+  }
+}
+
+function drawTexts() {
+  feedbackTexts.forEach(t => {
+    ctx.save();
+    ctx.globalAlpha = t.life;
+    ctx.font = 'bold 22px Arial';
+    ctx.fillStyle = t.color;
+    ctx.textAlign = 'center';
+    ctx.shadowColor = '#000';
+    ctx.shadowBlur = 6;
+    ctx.fillText(t.text, t.x, t.y);
+    ctx.restore();
+  });
+}
+
+// ── Input ──────────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (gameOver) return;
+  const idx = LANE_KEYS.indexOf(e.key);
+  if (idx === -1) return;
+  e.preventDefault();
+  if (keysDown[e.key]) return; // no repeat
+  keysDown[e.key] = true;
+  resumeAudio();
+
+  hitFlash[idx] = true;
+  hitFlashTimer[idx] = 8;
+
+  // Check for hit
+  let hit = false;
+  let bestDist = Infinity;
+  let bestNote = null;
+
+  notes.forEach(n => {
+    if (n.lane === idx && !n.hit && !n.missed) {
+      const dist = Math.abs(n.y - TARGET_Y);
+      if (dist < HIT_WINDOW && dist < bestDist) {
+        bestDist = dist;
+        bestNote = n;
+      }
+    }
+  });
+
+  if (bestNote) {
+    bestNote.hit = true;
+    hit = true;
+    groove = Math.min(100, groove + GROOVE_HIT);
+    score += 10 + combo * 2;
+    combo++;
+
+    // Dancing hamster
+    hamsterBounce = 30;
+
+    playHitSound(idx);
+
+    // Confetti at hit zone
+    spawnConfetti(LANE_X[idx], TARGET_Y, LANE_COLORS[idx]);
+
+    const label = combo > 5 ? '★ PERFECT!' : combo > 2 ? 'GREAT!' : 'NICE!';
+    spawnText(LANE_X[idx], TARGET_Y - 40, label, LANE_COLORS[idx]);
+  } else {
+    // Miss (pressed wrong time)
+    groove = Math.max(0, groove - GROOVE_MISS);
+    combo  = 0;
+    hamsterBounce = -20; // sleepy
+    playMissSound();
+    spawnText(LANE_X[idx], TARGET_Y - 40, 'MISS', '#ff4444');
+  }
+});
+
+document.addEventListener('keyup', e => {
+  keysDown[e.key] = false;
+});
+
+// ── Drawing: Background ────────────────────────────────────────────────────────
+function drawBackground() {
+  // Dark club gradient
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#0d0020');
+  grad.addColorStop(1, '#1a003a');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Subtle grid lines (dance floor feel)
+  ctx.strokeStyle = '#2a0055';
+  ctx.lineWidth = 1;
+  for (let y = 0; y < H; y += 40) {
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke();
+  }
+  for (let x = 0; x < W; x += 40) {
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke();
+  }
+}
+
+// ── Drawing: Lanes ─────────────────────────────────────────────────────────────
+function drawLanes() {
+  LANE_X.forEach((cx, i) => {
+    // Lane track
+    ctx.fillStyle = 'rgba(255,255,255,0.04)';
+    ctx.fillRect(cx - LANE_W/2, 0, LANE_W, H - 120);
+
+    // Target zone ring
+    const flash = hitFlashTimer[i] > 0;
+    ctx.save();
+    ctx.shadowColor = LANE_COLORS[i];
+    ctx.shadowBlur  = flash ? 30 : 12;
+    ctx.strokeStyle = flash ? '#ffffff' : LANE_COLORS[i];
+    ctx.lineWidth   = flash ? 4 : 2.5;
+    ctx.beginPath();
+    ctx.arc(cx, TARGET_Y, NOTE_R + 6, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+
+    // Key label inside ring
+    ctx.font = 'bold 14px Arial';
+    ctx.fillStyle = flash ? '#ffffff' : LANE_COLORS[i] + 'aa';
+    ctx.textAlign = 'center';
+    ctx.fillText(LANE_LABELS[i], cx, TARGET_Y + 5);
+  });
+}
+
+// ── Drawing: Notes ────────────────────────────────────────────────────────────
+function drawNotes() {
+  notes.forEach(n => {
+    if (n.hit || n.missed) return;
+    const cx = LANE_X[n.lane];
+    const cy = n.y;
+    const col = LANE_COLORS[n.lane];
+
+    // Glow
+    ctx.save();
+    ctx.shadowColor = col;
+    ctx.shadowBlur = 18;
+
+    // Main circle
+    ctx.beginPath();
+    ctx.arc(cx, cy, NOTE_R, 0, Math.PI * 2);
+    const ng = ctx.createRadialGradient(cx-6,cy-6,2,cx,cy,NOTE_R);
+    ng.addColorStop(0, '#ffffff');
+    ng.addColorStop(0.4, col);
+    ng.addColorStop(1, col + '88');
+    ctx.fillStyle = ng;
+    ctx.fill();
+
+    // Shine dot
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.beginPath();
+    ctx.arc(cx - 7, cy - 7, 5, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  });
+}
+
+// ── Drawing: Disco Ball ───────────────────────────────────────────────────────
+function drawDiscoBall(t) {
+  const cx = W / 2, cy = 68, r = 38;
+  const hot = groove > 70;
+
+  // Hanger
+  ctx.strokeStyle = '#aaaaaa';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, cy - r); ctx.stroke();
+
+  // Shadow
+  ctx.save();
+  ctx.shadowColor = hot ? '#ff00ff' : '#6600aa';
+  ctx.shadowBlur = hot ? 40 : 20;
+
+  // Ball base
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  const bg = ctx.createRadialGradient(cx-10,cy-10,4,cx,cy,r);
+  bg.addColorStop(0, '#aaaacc');
+  bg.addColorStop(1, '#333355');
+  ctx.fillStyle = bg;
+  ctx.fill();
+
+  // Mirror tiles (small colored squares across surface)
+  const tileColors = ['#ff4488','#44ddff','#ffcc00','#44ff88','#ffffff','#ff8800'];
+  for (let row = 0; row < 6; row++) {
+    for (let col = 0; col < 8; col++) {
+      const ang  = (col / 8) * Math.PI * 2 + discoAngle + row * 0.3;
+      const tilt = (row / 5 - 0.5) * Math.PI * 0.8;
+      const tx   = cx + Math.cos(ang) * Math.cos(tilt) * (r - 4);
+      const ty   = cy + Math.sin(tilt) * (r - 4);
+      const size = 7;
+      if (Math.sqrt((tx-cx)**2+(ty-cy)**2) > r) continue;
+      ctx.save();
+      const hue = hot
+        ? `hsl(${(discoAngle*80 + row*40 + col*20) % 360}, 100%, 65%)`
+        : tileColors[(row*3+col) % tileColors.length];
+      ctx.fillStyle = hue;
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(tx - size/2, ty - size/2, size, size);
+      ctx.restore();
+    }
+  }
+
+  ctx.restore();
+
+  // Light rays when hot
+  if (hot) {
+    for (let i = 0; i < 8; i++) {
+      const ang = discoAngle * 2 + (i / 8) * Math.PI * 2;
+      const col = tileColors[i % tileColors.length];
+      ctx.save();
+      ctx.globalAlpha = 0.12;
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 6;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(ang)*r, cy + Math.sin(ang)*r);
+      ctx.lineTo(cx + Math.cos(ang)*200, cy + Math.sin(ang)*200);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+// ── Drawing: Turntable ────────────────────────────────────────────────────────
+function drawTurntable(t) {
+  const cx = W/2, cy = H - 80;
+
+  // Base plinth
+  ctx.fillStyle = '#222233';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy+10, 110, 24, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle = '#6644aa';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Spinning platter
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(t * 0.003 * (groove/50 + 0.5));
+  const pg = ctx.createRadialGradient(0,0,5,0,0,80);
+  pg.addColorStop(0,'#555577');
+  pg.addColorStop(0.5,'#3a3a55');
+  pg.addColorStop(1,'#222233');
+  ctx.beginPath(); ctx.arc(0,0,80,0,Math.PI*2);
+  ctx.fillStyle = pg; ctx.fill();
+  // grooves
+  for (let gr=20; gr<=75; gr+=8) {
+    ctx.beginPath(); ctx.arc(0,0,gr,0,Math.PI*2);
+    ctx.strokeStyle='rgba(255,255,255,0.06)'; ctx.lineWidth=1; ctx.stroke();
+  }
+  // center label
+  ctx.beginPath(); ctx.arc(0,0,16,0,Math.PI*2);
+  ctx.fillStyle='#ff4488'; ctx.fill();
+  ctx.beginPath(); ctx.arc(0,0,4,0,Math.PI*2);
+  ctx.fillStyle='#111'; ctx.fill();
+  ctx.restore();
+
+  // Tone arm
+  ctx.save();
+  ctx.translate(cx+82, cy-30);
+  ctx.rotate(0.4 + Math.sin(t*0.001)*0.05);
+  ctx.strokeStyle='#ccccdd'; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(-60,50); ctx.stroke();
+  ctx.beginPath(); ctx.arc(0,0,7,0,Math.PI*2);
+  ctx.fillStyle='#8888aa'; ctx.fill();
+  ctx.restore();
+}
+
+// ── Drawing: Hamster ─────────────────────────────────────────────────────────
+function drawHamster(t) {
+  const cx = W/2;
+  let baseCY = H - 130;
+
+  // Bounce animation
+  let offsetY = 0, scaleX = 1, scaleY = 1;
+  if (hamsterBounce > 0) {
+    // Dancing: bob up/down fast
+    offsetY = Math.sin(t * 0.03) * 10 * (hamsterBounce/30);
+    scaleX = 1 + Math.abs(Math.sin(t*0.03))*0.05;
+    scaleY = 1 - Math.abs(Math.sin(t*0.03))*0.05;
+  } else if (hamsterBounce < 0) {
+    // Sleepy: squish flat
+    const frac = Math.abs(hamsterBounce)/20;
+    scaleX = 1 + frac*0.3;
+    scaleY = 1 - frac*0.25;
+    offsetY = frac * 8;
+  }
+
+  const cy = baseCY + offsetY;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(scaleX, scaleY);
+
+  // Body (big circle)
+  const bodyR = 32;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, bodyR, bodyR, 0, 0, Math.PI*2);
+  const hg = ctx.createRadialGradient(-8,-8,3,0,0,bodyR);
+  hg.addColorStop(0,'#ffcc99');
+  hg.addColorStop(1,'#dd9955');
+  ctx.fillStyle = hg;
+  ctx.fill();
+  ctx.strokeStyle='#cc7733'; ctx.lineWidth=2; ctx.stroke();
+
+  // Cheek pouches
+  ctx.fillStyle='#ffddaa';
+  ctx.beginPath(); ctx.ellipse(-20, 8, 12, 9, -0.3, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(20, 8, 12, 9, 0.3, 0, Math.PI*2); ctx.fill();
+
+  // Ears
+  ctx.fillStyle='#dd9955';
+  ctx.beginPath(); ctx.ellipse(-22,-26,10,13,-.3,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(22,-26,10,13,.3,0,Math.PI*2); ctx.fill();
+  // Inner ear
+  ctx.fillStyle='#ffaaaa';
+  ctx.beginPath(); ctx.ellipse(-22,-26,6,9,-.3,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(22,-26,6,9,.3,0,Math.PI*2); ctx.fill();
+
+  // Eyes
+  const eyeOpen = hamsterBounce >= 0;
+  ctx.fillStyle='#222222';
+  if (eyeOpen) {
+    ctx.beginPath(); ctx.arc(-11,-8,5,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(11,-8,5,0,Math.PI*2); ctx.fill();
+    // Shine
+    ctx.fillStyle='#ffffff';
+    ctx.beginPath(); ctx.arc(-9,-10,2,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(13,-10,2,0,Math.PI*2); ctx.fill();
+  } else {
+    // Sleepy closed eyes (lines)
+    ctx.strokeStyle='#222222'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(-15,-8); ctx.lineTo(-7,-8); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(7,-8); ctx.lineTo(15,-8); ctx.stroke();
+  }
+
+  // Nose
+  ctx.fillStyle='#ff8888';
+  ctx.beginPath(); ctx.arc(0,2,4,0,Math.PI*2); ctx.fill();
+
+  // Smile / expression
+  ctx.strokeStyle='#aa5522'; ctx.lineWidth=1.5;
+  if (hamsterBounce > 0) {
+    // Big grin
+    ctx.beginPath(); ctx.arc(0,6,10,0.2,Math.PI-0.2); ctx.stroke();
+  } else if (hamsterBounce < 0) {
+    // Frown
+    ctx.beginPath(); ctx.arc(0,18,10,Math.PI+0.2,-0.2); ctx.stroke();
+  } else {
+    // Neutral
+    ctx.beginPath(); ctx.moveTo(-7,12); ctx.lineTo(7,12); ctx.stroke();
+  }
+
+  // Tiny headphones
+  ctx.strokeStyle='#333355'; ctx.lineWidth=4;
+  ctx.beginPath();
+  ctx.arc(0,-20,24,Math.PI+0.4,-0.4,false);
+  ctx.stroke();
+  ctx.fillStyle='#555577';
+  ctx.beginPath(); ctx.ellipse(-22,-20,7,10,0.2,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(22,-20,7,10,-0.2,0,Math.PI*2); ctx.fill();
+
+  ctx.restore();
+}
+
+// ── Drawing: Groove Meter ──────────────────────────────────────────────────────
+function drawGrooveMeter() {
+  const x=10, y=H-55, mw=W-20, mh=22;
+
+  ctx.fillStyle='rgba(0,0,0,0.4)';
+  ctx.beginPath(); ctx.roundRect(x,y,mw,mh,11); ctx.fill();
+
+  // Fill
+  const frac = groove/100;
+  const grad = ctx.createLinearGradient(x,0,x+mw,0);
+  grad.addColorStop(0,'#ff4488');
+  grad.addColorStop(0.5,'#ffcc00');
+  grad.addColorStop(1,'#44ff88');
+  ctx.fillStyle = grad;
+  ctx.save();
+  ctx.beginPath(); ctx.roundRect(x,y,mw*frac,mh,11); ctx.clip();
+  ctx.fillRect(x,y,mw*frac,mh);
+  ctx.restore();
+
+  // Border
+  ctx.strokeStyle='#9966cc';
+  ctx.lineWidth=2;
+  ctx.beginPath(); ctx.roundRect(x,y,mw,mh,11); ctx.stroke();
+
+  // Label
+  ctx.font='bold 13px Arial';
+  ctx.fillStyle='#ffffff';
+  ctx.textAlign='left';
+  ctx.fillText(`Groove: ${Math.round(groove)}%`, x+8, y+15);
+
+  // Score
+  ctx.textAlign='right';
+  ctx.fillText(`Score: ${score}`, x+mw-8, y+15);
+}
+
+// ── Drawing: HUD ──────────────────────────────────────────────────────────────
+function drawHUD() {
+  // Combo
+  if (combo > 1) {
+    ctx.save();
+    const pulse = 1 + Math.sin(Date.now()*0.01)*0.05;
+    ctx.font = `bold ${Math.round(18*pulse)}px Arial`;
+    ctx.fillStyle = '#ffcc00';
+    ctx.textAlign = 'center';
+    ctx.shadowColor='#ff8800';
+    ctx.shadowBlur=10;
+    ctx.fillText(`${combo}x COMBO!`, W/2, 150);
+    ctx.restore();
+  }
+}
+
+// ── Song Progress / Game End ──────────────────────────────────────────────────
+function checkSongEnd(now) {
+  const elapsed = now - songStart;
+  if (elapsed >= SONG_DURATION && !gameOver) {
+    gameOver = true;
+    document.getElementById('restartBtn').style.display = 'inline-block';
+  }
+}
+
+// Draw "Game Over / Song Done" overlay
+function drawEndScreen() {
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,20,0.75)';
+  ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.shadowColor='#ff00ff';
+  ctx.shadowBlur=30;
+  ctx.font='bold 46px Arial';
+  ctx.fillStyle='#ffcc00';
+  ctx.fillText('SONG DONE!', W/2, H/2-40);
+  ctx.font='bold 26px Arial';
+  ctx.fillStyle='#44ffcc';
+  ctx.fillText(`Final Score: ${score}`, W/2, H/2+10);
+  ctx.fillText(`Groove: ${Math.round(groove)}%`, W/2, H/2+45);
+  ctx.restore();
+}
+
+// Progress bar at top
+function drawProgress(now) {
+  const elapsed = now - songStart;
+  const frac = Math.min(elapsed/SONG_DURATION,1);
+  ctx.fillStyle='rgba(0,0,0,0.3)';
+  ctx.fillRect(0,0,W,6);
+  const pg=ctx.createLinearGradient(0,0,W,0);
+  pg.addColorStop(0,'#ff4488');pg.addColorStop(1,'#44ff88');
+  ctx.fillStyle=pg;
+  ctx.fillRect(0,0,W*frac,6);
+}
+
+// ── Update ────────────────────────────────────────────────────────────────────
+function update(t) {
+  const now = performance.now();
+
+  // Spawn notes from beat chart
+  spawnScheduledNotes(now);
+
+  // Move notes
+  for (let i = notes.length-1; i >= 0; i--) {
+    const n = notes[i];
+    if (!n.hit && !n.missed) {
+      n.y += NOTE_SPEED;
+      // Auto-miss if scrolled past
+      if (n.y > TARGET_Y + HIT_WINDOW*1.5) {
+        n.missed = true;
+        groove = Math.max(0, groove - GROOVE_MISS);
+        combo  = 0;
+        hamsterBounce = -20;
+        playMissSound();
+        spawnText(LANE_X[n.lane], TARGET_Y - 30, 'MISS', '#ff4444');
+      }
+    }
+    // Remove old notes
+    if (n.y > H + 20) notes.splice(i,1);
+  }
+
+  // Decay hamster state
+  if (hamsterBounce > 0) hamsterBounce = Math.max(0, hamsterBounce-0.5);
+  if (hamsterBounce < 0) hamsterBounce = Math.min(0, hamsterBounce+0.4);
+
+  // Disco rotation
+  discoAngle += groove > 70 ? 0.06 : 0.02;
+
+  // Hit flash timers
+  hitFlashTimer = hitFlashTimer.map(v => Math.max(0,v-1));
+
+  updateParticles();
+  updateTexts();
+  checkSongEnd(now);
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render(t) {
+  const now = performance.now();
+  drawBackground();
+  drawDiscoBall(t);
+  drawProgress(now);
+  drawLanes();
+  drawTurntable(t);
+  drawHamster(t);
+  drawNotes();
+  drawParticles();
+  drawTexts();
+  drawGrooveMeter();
+  drawHUD();
+  if (gameOver) drawEndScreen();
+}
+
+// ── Main Loop ─────────────────────────────────────────────────────────────────
+function loop(t) {
+  if (!gameOver) update(t);
+  render(t);
+  requestAnimationFrame(loop);
+}
+
+// ── Restart ───────────────────────────────────────────────────────────────────
+function restartGame() {
+  notes       = [];
+  particles   = [];
+  feedbackTexts = [];
+  groove      = 50;
+  score       = 0;
+  combo       = 0;
+  keysDown    = {};
+  hamsterBounce = 0;
+  discoAngle  = 0;
+  gameOver    = false;
+  beatIndex   = 0;
+  hitFlash    = [false,false,false,false];
+  hitFlashTimer=[0,0,0,0];
+  songStart   = performance.now();
+  stopBeat(); startBeat();
+  document.getElementById('restartBtn').style.display = 'none';
+}
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+songStart = performance.now();
+startBeat();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
