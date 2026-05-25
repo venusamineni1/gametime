@@ -39,6 +39,10 @@
 const canvas = document.getElementById('gameCanvas');
 const ctx    = canvas.getContext('2d');
 
+// ── Slingshot positions ───────────────────────────────────────────────────────
+let SLING_X = Math.round(canvas.width * 0.20);   // 200 on the 1000-wide canvas
+let SLING_Y = canvas.height - 150;                // 550 on the 700-tall canvas
+
 // ── Audio ─────────────────────────────────────────────────────────────────────
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
@@ -127,9 +131,7 @@ const game = {
     }
 };
 
-// ── Slingshot & Cat Positions ─────────────────────────────────────────────────
-const SLING_X = 200;
-const SLING_Y = canvas.height - 150;
+// ── Mouth radius ──────────────────────────────────────────────────────────────
 const MOUTH_R = 40;
 
 // ── Meatball ──────────────────────────────────────────────────────────────────
@@ -1092,7 +1094,7 @@ function drawUI() {
 
     // Shots counter
     ctx.fillStyle = 'rgba(200,200,255,0.6)';
-    ctx.font = 'bold 12px Segoe UI, Arial';
+        ctx.font = 'bold 12px Segoe UI, Arial';
     ctx.fillText(`SHOTS: ${game.totalShots}`, 28, 86);
 
     ctx.restore();
@@ -1243,6 +1245,31 @@ canvas.addEventListener('mouseup', () => {
     playLaunch();
 });
 
+// ── Touch Support (registered once, not inside drawUI) ────────────────────────
+canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    const touch = e.touches[0];
+    canvas.dispatchEvent(new MouseEvent('mousedown', { clientX: touch.clientX, clientY: touch.clientY }));
+}, { passive: false });
+
+canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const touch = e.touches[0];
+    const rect = canvas.getBoundingClientRect();
+    const mx = (touch.clientX - rect.left) * (canvas.width / rect.width);
+    const my = (touch.clientY - rect.top)  * (canvas.height / rect.height);
+    if (game.isDragging && game.meatballBeingDragged) {
+        game.dragLogical = { x: mx, y: my };
+        game.meatballBeingDragged.x = mx;
+        game.meatballBeingDragged.y = Math.min(my, canvas.height - 20);
+    }
+}, { passive: false });
+
+canvas.addEventListener('touchend', e => {
+    e.preventDefault();
+    canvas.dispatchEvent(new MouseEvent('mouseup'));
+}, { passive: false });
+
 // ── Game Loop ─────────────────────────────────────────────────────────────────
 function gameLoop() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -1306,23 +1333,24 @@ function gameLoop() {
                     if (game.level === 8) {
                         game.portals[0].active = true;
                         game.portals[1].active = true;
+                    } else if (game.level >= 6 && game.mouthCycleTimer % 180 > 90) {
+                        // Bounce off impatient cat's closed mouth
+                        if (Math.hypot(mb.x - game.catX, mb.y - (game.catY - 10)) < 60) {
+                            mb.vx *= -0.7;
+                            mb.vy *= -0.7;
+                            mb.x += mb.vx;
+                            mb.y += mb.vy;
+                            playMiss();
+                        }
                     }
                 } else {
+                    // Beat the final level → win
                     game.gameWon = true;
                     playWin();
                 }
-            }
-        } else if (game.level >= 6 && game.mouthCycleTimer % 180 > 90) {
-            // Bounce off impatient cat's closed mouth
-            if (Math.hypot(mb.x - game.catX, mb.y - (game.catY - 10)) < 60) {
-                mb.vx *= -0.7;
-                mb.vy *= -0.7;
-                mb.x += mb.vx;
-                mb.y += mb.vy;
-                playMiss();
-            }
-        }
-    }
+            }   // closes if (game.meatballsFed >= 5)
+        }       // closes if (checkMouthCollision)
+    }           // closes meatball for-loop
 
     drawSplats();
 
@@ -1397,8 +1425,8 @@ function gameLoop() {
                     createSauceSplash(mb.x, mb.y);
                 }
             }
-        }
-    }
+        }       // closes else (dog active)
+    }           // closes if (game.level >= 4)
 
     // Cat animation timers
     if (game.catHappyTimer > 0)   game.catHappyTimer--;   else game.catHappy = false;
@@ -1428,7 +1456,9 @@ function gameLoop() {
     requestAnimationFrame(gameLoop);
 }
 
+
 gameLoop();
+
 </script>
 </body>
 </html>
